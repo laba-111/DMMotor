@@ -4,6 +4,9 @@
 xrobot 模块一致的单类、单头文件结构。类内不维护 `DM4310`、`DM4340`、
 `DM8009` 等型号枚举；型号差异全部由每个实例的 `DMMotor::Param` 表达。
 
+适用于 XRobot 1.0.1 与 LibXR 6.0.1 代码生成工具对应的 BSP。模块通过构造参数
+直接接收 `LibXR::CAN&`，不再使用 `ApplicationManager` 或硬件名称查找。
+
 ## 设计边界
 
 - 本模块负责 CAN 收发、MIT/PV/V/PVT 报文打包、反馈解码和在线状态记录。
@@ -11,6 +14,8 @@ xrobot 模块一致的单类、单头文件结构。类内不维护 `DM4310`、`
 - `control_id` 和 `feedback_id` 都是完整 CAN ID，不推导 `ID + 0x10`。
 - `limits` 必须与达妙上位机中的 `PMAX/VMAX/TMAX` 一致，否则命令和反馈都会缩放错误。
 - 一台电机在一个实例中只使用一种 `ControlType`；切换电机内部模式后应同步修改实例配置。
+- CAN 回调只发布最新反馈快照，由一个控制线程串行调用 `Update()` 解码；
+  多帧积压时只保留最新帧，不回放旧反馈。
 
 ## 文件
 
@@ -26,7 +31,6 @@ xrobot 模块一致的单类、单头文件结构。类内不维护 `DM4310`、`
 #include "DMMotor.hpp"
 
 DMMotor::Param dm4310_param{
-    "can1",                         // CAN 硬件在 HardwareContainer 中的名称
     "roll_4310",                    // 仅用于辨识实例
     0x004,                           // 当前控制模式使用的完整控制 ID
     0x104,                           // 上位机配置的反馈 ID / MST_ID
@@ -40,7 +44,6 @@ DMMotor::Param dm4310_param{
 };
 
 DMMotor::Param dm4340_param{
-    "can1",
     "pitch_4340",
     0x005,
     0x105,
@@ -53,8 +56,8 @@ DMMotor::Param dm4340_param{
      -28.0f, 28.0f},
 };
 
-DMMotor dm4310(hw, app, dm4310_param);
-DMMotor dm4340(hw, app, dm4340_param);
+DMMotor dm4310(can1, dm4310_param);
+DMMotor dm4340(can1, dm4340_param);
 ```
 
 同一个类可以创建任意数量、任意型号的实例；只要每个实例的 CAN ID 不冲突，
@@ -62,7 +65,7 @@ DMMotor dm4340(hw, app, dm4340_param);
 
 ## 2. 周期更新与控制
 
-上层控制线程中先调用 `Update()` 消费反馈，再根据反馈状态使能、清错或控制：
+上层控制线程中先调用 `Update()` 读取最新反馈，再根据反馈状态使能、清错或控制：
 
 ```cpp
 void MotorLoop(DMMotor& motor) {
@@ -119,7 +122,7 @@ motor.PositionVelocityTorqueControl(position,
 
 ```cpp
 DMMotor::Param velocity_motor_param{
-    "can1", "velocity_motor", 0x205, 0x105, false,
+    "velocity_motor", 0x205, 0x105, false,
     DMMotor::ControlType::V,
     {-3.14159f, 3.14159f, -10.0f, 10.0f,
      0.0f, 500.0f, 0.0f, 5.0f, -28.0f, 28.0f},
@@ -128,27 +131,35 @@ DMMotor::Param velocity_motor_param{
 
 ## 4. YAML 构造参数
 
-模块头部已经提供 Manifest V2。对应的参数形状如下：
+Manifest V2 声明依赖 `QDU-Robomaster/Motor`；XRobot 从公开 C++ 构造函数读取
+参数，完整应用配置如下。`can1` 是 BSP 通过 `XR_REGISTER` 注册的 CAN 对象，
+`motor_name` 是 C++ 字符串字面量。
 
 ```yaml
-param:
-  can_bus_name: can1
-  motor_name: roll_4310
-  control_id: 4
-  feedback_id: 260
-  reverse: false
-  control_type: DMMotor::ControlType::MIT
-  limits:
-    p_min: -3.1415926
-    p_max: 3.1415926
-    v_min: -30.0
-    v_max: 30.0
-    kp_min: 0.0
-    kp_max: 500.0
-    kd_min: 0.0
-    kd_max: 5.0
-    t_min: -10.0
-    t_max: 10.0
+modules:
+  - module: laba-111/DMMotor
+    id: roll_4310
+    args:
+      - can_bus: can1
+      - param:
+          motor_name: '"roll_4310"'
+          control_id: 4
+          feedback_id: 260
+          reverse: false
+          control_type: DMMotor::ControlType::MIT
+          limits:
+            p_min: -3.1415926f
+            p_max: 3.1415926f
+            v_min: -30.0f
+            v_max: 30.0f
+            kp_min: 0.0f
+            kp_max: 500.0f
+            kd_min: 0.0f
+            kd_max: 5.0f
+            t_min: -10.0f
+            t_max: 10.0f
+settings:
+  monitor_sleep_ms: 1000
 ```
 
 ## 5. 调试顺序
@@ -162,3 +173,19 @@ param:
 
 `GetLastTxStatus()` 可查看最近一次发送结果，`IsOnline(timeout_us)` 可按反馈时间
 判断电机是否在线；默认超时时间为 100 ms。
+
+## 6. 原生协议回归测试
+
+在 Linux 上使用支持 C++20 的 GCC 或 Clang，传入当前 LibXR 和 Motor 模块的源码目录：
+
+```sh
+cmake -S tests -B /tmp/dmmotor-protocol \
+  -DLIBXR_SOURCE_DIR=/path/to/LibXR \
+  -DMOTOR_MODULE_DIR=/path/to/Motor
+cmake --build /tmp/dmmotor-protocol
+ctest --test-dir /tmp/dmmotor-protocol --output-on-failure
+```
+
+测试使用实际 LibXR CAN 分发器和最新反馈快照，模拟总线与时间，检查四种控制协议的
+报文字节、量程钳制、反向、特殊命令、CAN ID 过滤、反馈突发、短帧和在线超时。
+这些测试不验证实际 CAN 外设或电机硬件。
