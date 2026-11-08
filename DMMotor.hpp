@@ -1,506 +1,450 @@
 #pragma once
+
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: 达妙（DM）电机 CAN 驱动模块，支持 DM4310 与 DM8009 / CAN driver Module for Damiao (DM) motors, supporting the DM4310 and DM8009
+module_description: 达妙电机通用控制层，型号差异由每个实例的 ID 与映射量程配置表达
+constructor_args:
+  - param:
+      can_bus_name: can1
+      motor_name: dm_motor
+      control_id: 1
+      feedback_id: 257
+      reverse: false
+      control_type: DMMotor::ControlType::MIT
+      limits:
+        p_min: -3.1415926
+        p_max: 3.1415926
+        v_min: -30.0
+        v_max: 30.0
+        kp_min: 0.0
+        kp_max: 500.0
+        kd_min: 0.0
+        kd_max: 5.0
+        t_min: -10.0
+        t_max: 10.0
+template_args: []
+required_hardware: []
 depends:
-- id: QDU-Robomaster/Motor
-  ref: same-or-dev
+  - qdu-future/Motor
 === END MANIFEST === */
 // clang-format on
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 
 #include "Motor.hpp"
+#include "app_framework.hpp"
 #include "can.hpp"
-#include "latest_snapshot.hpp"
+#include "libxr_assert.hpp"
 #include "libxr_def.hpp"
 #include "libxr_type.hpp"
-
-// DM4310 量程：位置 (rad)、速度 (rad/s)、力矩 (N·m)、KP、KD
-// DM4310 ranges: position (rad), velocity (rad/s), torque (N·m), KP, KD
-#define DM4310_PMAX (6.283185f)
-#define DM4310_VMAX (30.0f)
-#define DM4310_TMAX (10.0f)
-#define DM4310_KP_MIN (0.0f)
-#define DM4310_KP_MAX (500.0f)
-#define DM4310_KD_MIN (0.0f)
-#define DM4310_KD_MAX (5.0f)
-
-// DM8009 量程：位置 (rad)、速度 (rad/s)、力矩 (N·m)、KP、KD
-// DM8009 ranges: position (rad), velocity (rad/s), torque (N·m), KP, KD
-#define DM8009_PMAX (12.56637f)
-#define DM8009_VMAX (45.0f)
-#define DM8009_TMAX (54.0f)
-#define DM8009_KP_MIN (0.0f)
-#define DM8009_KP_MAX (500.0f)
-#define DM8009_KD_MIN (0.0f)
-#define DM8009_KD_MAX (5.0f)
+#include "timebase.hpp"
 
 /**
- * @brief 达妙（DM）电机 CAN 驱动，实现 Motor 接口。
- *        CAN driver for Damiao (DM) motors, implementing the Motor interface.
+ * @class DMMotor
+ * @brief 达妙电机通用控制层。
+ *
+ * @details
+ * 类中只实现 CAN 协议、控制报文打包和反馈解码。电机型号不在类内枚举，
+ * 每台电机通过 Param::limits、control_id 和 feedback_id 描述自身差异。
  */
-class DMMotor : public Motor
-{
+class DMMotor : public LibXR::Application, public Motor {
  public:
-  /**
-   * @brief 电机型号。
-   *        Motor model.
-   */
-  enum class Model : uint8_t
-  {
-    MOTOR_NONE = 0,  ///< 未指定，各项量程为 0
-                     ///< Unspecified, all ranges are 0
-    MOTOR_DM4310,    ///< DM4310
-    MOTOR_DM8009,    ///< DM8009
+  /** @brief 电机当前在达妙上位机中配置的控制协议。 */
+  enum class ControlType : uint8_t {
+    MIT = 0,
+    PV = 1,
+    V = 2,
+    PVT = 3,
   };
 
   /**
-   * @brief 电机配置参数。
-   *        Motor configuration parameters.
+   * @brief MIT 定点映射量程。
+   * @warning 必须与电机参数中的 PMAX、VMAX、TMAX 保持一致。
    */
-  struct Param
-  {
-    Model model;      ///< 电机型号
-                      ///< Motor model
-    bool reverse;     ///< 反向：反馈与下发的位置、速度、力矩取反
-                      ///< Reverse: negates the position, velocity and torque of the
-                      ///< feedback and of the commands
-    uint16_t can_id;  ///< 电机控制 ID，反馈 ID 为 0x10 + can_id
-                      ///< Motor control ID; the feedback ID is 0x10 + can_id
+  struct LimitParam {
+    float p_min;
+    float p_max;
+    float v_min;
+    float v_max;
+    float kp_min;
+    float kp_max;
+    float kd_min;
+    float kd_max;
+    float t_min;
+    float t_max;
   };
 
-  /**
-   * @brief 型号量程。
-   *        Model ranges.
-   */
-  struct LSB
-  {
-    float P_MAX;   ///< 位置量程 (rad)
-                   ///< Position range (rad)
-    float V_MAX;   ///< 速度量程 (rad/s)
-                   ///< Velocity range (rad/s)
-    float T_MAX;   ///< 力矩量程 (N·m)
-                   ///< Torque range (N·m)
-    float KD_MIN;  ///< KD 下限
-                   ///< KD lower bound
-    float KD_MAX;  ///< KD 上限
-                   ///< KD upper bound
-    float KP_MIN;  ///< KP 下限
-                   ///< KP lower bound
-    float KP_MAX;  ///< KP 上限
-                   ///< KP upper bound
+  /** @brief 单台电机的实例配置。 */
+  struct Param {
+    const char* can_bus_name;
+    const char* motor_name;
+    uint32_t control_id;
+    uint32_t feedback_id;
+    bool reverse;
+    ControlType control_type;
+    LimitParam limits;
   };
 
-  /**
-   * @brief 构造 DMMotor，并在 CAN 总线上注册反馈帧接收回调。
-   *        Construct DMMotor and register the feedback-frame receive callback on the CAN
-   *        bus.
-   *
-   * @param can_bus 电机所在的 CAN 总线。
-   *                CAN bus the motor is attached to.
-   * @param param 电机配置参数。
-   *              Motor configuration parameters.
-   */
-  DMMotor(LibXR::CAN& can_bus,
-          const Param& param = {.model = DMMotor::Model::MOTOR_DM4310,
-                                .reverse = false,
-                                .can_id = 1})
-      : param_(param), feedback_{}, can_(std::addressof(can_bus))
-  {
-    switch (param_.model)
-    {
-      case Model::MOTOR_DM4310:
-        lsb_.P_MAX = DM4310_PMAX;
-        lsb_.V_MAX = DM4310_VMAX;
-        lsb_.T_MAX = DM4310_TMAX;
-        lsb_.KD_MIN = DM4310_KD_MIN;
-        lsb_.KD_MAX = DM4310_KD_MAX;
-        lsb_.KP_MIN = DM4310_KP_MIN;
-        lsb_.KP_MAX = DM4310_KP_MAX;
-        break;
-      case Model::MOTOR_DM8009:
-        lsb_.P_MAX = DM8009_PMAX;
-        lsb_.V_MAX = DM8009_VMAX;
-        lsb_.T_MAX = DM8009_TMAX;
-        lsb_.KD_MIN = DM8009_KD_MIN;
-        lsb_.KD_MAX = DM8009_KD_MAX;
-        lsb_.KP_MIN = DM8009_KP_MIN;
-        lsb_.KP_MAX = DM8009_KP_MAX;
-        break;
-      case Model::MOTOR_NONE:
-        lsb_.P_MAX = 0;
-        lsb_.V_MAX = 0;
-        lsb_.T_MAX = 0;
-        lsb_.KD_MIN = 0;
-        lsb_.KD_MAX = 0;
-        lsb_.KP_MIN = 0;
-        lsb_.KP_MAX = 0;
-        break;
-    }
-    // 反馈帧 ID 为 0x10 + can_id
-    uint16_t feedback_id_to_register = 0x10 + param_.can_id;
+  DMMotor(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
+          const Param& param)
+      : param_(param),
+        can_(hw.template FindOrExit<LibXR::CAN>({param_.can_bus_name})) {
+    UNUSED(app);
+    ASSERT(IsParamValid(param_));
 
     auto rx_callback = LibXR::CAN::Callback::Create(
-        [](bool in_isr, DMMotor* self, const LibXR::CAN::ClassicPack& pack)
-        { RxCallback(in_isr, self, pack); }, this);
+        [](bool in_isr, DMMotor* self,
+           const LibXR::CAN::ClassicPack& pack) {
+          RxCallback(in_isr, self, pack);
+        },
+        this);
+
     can_->Register(rx_callback, LibXR::CAN::Type::STANDARD,
-                   LibXR::CAN::FilterMode::ID_RANGE, feedback_id_to_register,
-                   feedback_id_to_register);
+                   LibXR::CAN::FilterMode::ID_RANGE, param_.feedback_id,
+                   param_.feedback_id);
   }
 
-  /**
-   * @brief 发送使能帧 (0xFC)。
-   *        Send the enable frame (0xFC).
-   */
-  void Enable() override
-  {
-    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
-    uint16_t id = param_.can_id;
-    LibXR::CAN::ClassicPack tx_pack{};
-    tx_pack.id = id;
-    tx_pack.type = LibXR::CAN::Type::STANDARD;
-    tx_pack.dlc = 8;
-    memcpy(tx_pack.data, data, 8);
-    can_->AddMessage(tx_pack);
-  }
+  /** @brief 发送达妙使能命令。 */
+  void Enable() override { last_tx_status_ = SendSpecialCommand(0xFC); }
 
-  /**
-   * @brief 发送失能帧 (0xFD)。
-   *        Send the disable frame (0xFD).
-   */
-  void Disable() override
-  {
-    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
-    uint16_t id = param_.can_id;
-    LibXR::CAN::ClassicPack tx_pack{};
-    tx_pack.id = id;
-    tx_pack.type = LibXR::CAN::Type::STANDARD;
-    tx_pack.dlc = 8;
-    memcpy(tx_pack.data, data, 8);
-    can_->AddMessage(tx_pack);
-  }
+  /** @brief 发送达妙失能命令。 */
+  void Disable() override { last_tx_status_ = SendSpecialCommand(0xFD); }
 
-  /**
-   * @brief 松开电机，等同于 Disable()。
-   *        Relax the motor; the same as Disable().
-   */
+  /** @brief 控制层的 Relax 等价于失能电机。 */
   void Relax() override { Disable(); }
 
-  /**
-   * @brief 取出最新的反馈帧并解码到反馈数据。
-   *        Take the latest feedback frame and decode it into the feedback data.
-   *
-   * @return 始终为 ErrorCode::OK。
-   *         Always ErrorCode::OK.
-   */
-  LibXR::ErrorCode Update() override
-  {
-    LibXR::CAN::ClassicPack pack;
-    if (feedback_frame_.LoadLatest(pack))
-    {
-      this->Decode(pack);
-      last_online_time_ = LibXR::Timebase::GetMicroseconds();
-    }
-    return LibXR::ErrorCode::OK;
+  /** @brief 清除电机故障。 */
+  void ClearError() override { last_tx_status_ = SendSpecialCommand(0xFB); }
+
+  /** @brief 将当前位置保存为电机零点。 */
+  void SaveZeroPoint() override {
+    last_tx_status_ = SendSpecialCommand(0xFE);
   }
 
   /**
-   * @brief 获取最近一次解码的反馈。
-   *        Get the most recently decoded feedback.
-   *
-   * @return 反馈数据的引用。
-   *         Reference to the feedback data.
+   * @brief 消费 CAN 接收队列并刷新反馈。
+   * @return OK 表示队列为空或所有帧解析成功；SIZE_ERR 表示收到短帧。
    */
+  LibXR::ErrorCode Update() override {
+    LibXR::ErrorCode result = LibXR::ErrorCode::OK;
+    LibXR::CAN::ClassicPack pack{};
+
+    while (recv_queue_.Pop(pack) == LibXR::ErrorCode::OK) {
+      const LibXR::ErrorCode decode_result = Decode(pack);
+      if (decode_result == LibXR::ErrorCode::OK) {
+        last_online_time_ = LibXR::Timebase::GetMicroseconds();
+      } else {
+        result = decode_result;
+      }
+    }
+
+    return result;
+  }
+
   const Feedback& GetFeedback() override { return feedback_; }
 
   /**
-   * @brief 按控制模式下发控制帧。
-   *        Send a control frame according to the control mode.
+   * @brief 通过统一 Motor 接口发送命令。
    *
-   * @param cmd 控制命令。MODE_MIT 使用 position、velocity、kp、kd、torque；MODE_TORQUE
-   *            仅使用 torque；MODE_POSITION 使用 position、velocity；MODE_VELOCITY
-   *            使用 velocity；其他模式忽略。
-   *            Control command. MODE_MIT uses position, velocity, kp, kd and torque;
-   *            MODE_TORQUE uses only torque; MODE_POSITION uses position and velocity;
-   *            MODE_VELOCITY uses velocity; other modes are ignored.
+   * MODE_MIT、MODE_TORQUE 对应 MIT；MODE_POSITION 对应 PV/PVT；
+   * MODE_VELOCITY 对应 V。命令模式与 Param::control_type 不匹配时不发帧。
    */
-  void Control(const MotorCmd& cmd) override
-  {
-    switch (cmd.mode)
-    {
+  void Control(const MotorCmd& cmd) override {
+    switch (cmd.mode) {
       case ControlMode::MODE_POSITION:
-        PosControl(cmd.position, cmd.velocity);
+        if (param_.control_type == ControlType::PV) {
+          last_tx_status_ = PositionVelocityControl(cmd.position, cmd.velocity);
+        } else if (param_.control_type == ControlType::PVT) {
+          last_tx_status_ = PositionVelocityTorqueControl(
+              cmd.position, cmd.velocity, cmd.torque);
+        } else {
+          last_tx_status_ = LibXR::ErrorCode::STATE_ERR;
+        }
         break;
+
       case ControlMode::MODE_VELOCITY:
-        SpdControl(cmd.velocity);
+        last_tx_status_ = VelocityControl(cmd.velocity);
         break;
+
       case ControlMode::MODE_TORQUE:
-        MITControl(0.0f, 0.0f, 0.0f, 0.0f, cmd.torque);
+        last_tx_status_ = MITControl(0.0f, 0.0f, 0.0f, 0.0f, cmd.torque);
         break;
+
       case ControlMode::MODE_MIT:
-        MITControl(cmd.position, cmd.velocity, cmd.kp, cmd.kd, cmd.torque);
+        last_tx_status_ = MITControl(cmd.position, cmd.velocity, cmd.kp,
+                                     cmd.kd, cmd.torque);
         break;
+
+      case ControlMode::MODE_CURRENT:
       default:
+        last_tx_status_ = LibXR::ErrorCode::NOT_SUPPORT;
         break;
     }
   }
 
-  /**
-   * @brief 发送清错帧 (0xFB)。
-   *        Send the clear-error frame (0xFB).
-   */
-  void ClearError() override
-  {
-    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB};
-    uint16_t id = param_.can_id;
-    LibXR::CAN::ClassicPack tx_pack{};
-    tx_pack.id = id;
-    tx_pack.type = LibXR::CAN::Type::STANDARD;
-    tx_pack.dlc = 8;
-    memcpy(tx_pack.data, data, 8);
-    can_->AddMessage(tx_pack);
+  /** @brief 发送 MIT 位置、速度、刚度、阻尼和前馈扭矩命令。 */
+  LibXR::ErrorCode MITControl(float position, float velocity, float kp,
+                              float kd, float torque) override {
+    if (param_.control_type != ControlType::MIT) {
+      last_tx_status_ = LibXR::ErrorCode::STATE_ERR;
+      return last_tx_status_;
+    }
+
+    const LimitParam& limit = param_.limits;
+    const float send_position = ToMotorDirection(
+        position, limit.p_min, limit.p_max);
+    const float send_velocity = ToMotorDirection(
+        velocity, limit.v_min, limit.v_max);
+    const float send_torque = ToMotorDirection(torque, limit.t_min,
+                                                limit.t_max);
+    kp = std::clamp(kp, limit.kp_min, limit.kp_max);
+    kd = std::clamp(kd, limit.kd_min, limit.kd_max);
+
+    const uint16_t position_raw =
+        FloatToUint(send_position, limit.p_min, limit.p_max, 16);
+    const uint16_t velocity_raw =
+        FloatToUint(send_velocity, limit.v_min, limit.v_max, 12);
+    const uint16_t kp_raw =
+        FloatToUint(kp, limit.kp_min, limit.kp_max, 12);
+    const uint16_t kd_raw =
+        FloatToUint(kd, limit.kd_min, limit.kd_max, 12);
+    const uint16_t torque_raw =
+        FloatToUint(send_torque, limit.t_min, limit.t_max, 12);
+
+    uint8_t data[8]{};
+    data[0] = static_cast<uint8_t>(position_raw >> 8);
+    data[1] = static_cast<uint8_t>(position_raw);
+    data[2] = static_cast<uint8_t>(velocity_raw >> 4);
+    data[3] = static_cast<uint8_t>(((velocity_raw & 0x0F) << 4) |
+                                   (kp_raw >> 8));
+    data[4] = static_cast<uint8_t>(kp_raw);
+    data[5] = static_cast<uint8_t>(kd_raw >> 4);
+    data[6] = static_cast<uint8_t>(((kd_raw & 0x0F) << 4) |
+                                   (torque_raw >> 8));
+    data[7] = static_cast<uint8_t>(torque_raw);
+
+    last_tx_status_ = SendFrame(param_.control_id, data, sizeof(data));
+    return last_tx_status_;
+  }
+
+  /** @brief 发送位置速度模式命令，数据为两个小端 float。 */
+  LibXR::ErrorCode PositionVelocityControl(float position, float velocity) {
+    if (param_.control_type != ControlType::PV) {
+      last_tx_status_ = LibXR::ErrorCode::STATE_ERR;
+      return last_tx_status_;
+    }
+
+    const LimitParam& limit = param_.limits;
+    const float send_position = ToMotorDirection(
+        position, limit.p_min, limit.p_max);
+    const float send_velocity = ToMotorDirection(
+        velocity, limit.v_min, limit.v_max);
+
+    uint8_t data[8]{};
+    std::memcpy(data, &send_position, sizeof(send_position));
+    std::memcpy(data + sizeof(send_position), &send_velocity,
+                sizeof(send_velocity));
+
+    last_tx_status_ = SendFrame(param_.control_id, data, sizeof(data));
+    return last_tx_status_;
+  }
+
+  /** @brief 发送速度模式命令，数据为一个小端 float。 */
+  LibXR::ErrorCode VelocityControl(float velocity) {
+    if (param_.control_type != ControlType::V) {
+      last_tx_status_ = LibXR::ErrorCode::STATE_ERR;
+      return last_tx_status_;
+    }
+
+    const LimitParam& limit = param_.limits;
+    const float send_velocity = ToMotorDirection(
+        velocity, limit.v_min, limit.v_max);
+
+    uint8_t data[4]{};
+    std::memcpy(data, &send_velocity, sizeof(send_velocity));
+
+    last_tx_status_ = SendFrame(param_.control_id, data, sizeof(data));
+    return last_tx_status_;
   }
 
   /**
-   * @brief 发送保存零点帧 (0xFE)，将当前位置设为零点。
-   *        Send the save-zero-point frame (0xFE), setting the current position as the
-   *        zero point.
+   * @brief 发送位置速度力矩模式命令。
+   * @param position 目标位置，rad。
+   * @param velocity_limit 速度幅值上限，rad/s。
+   * @param torque_limit 扭矩幅值上限，Nm。
    */
-  void SaveZeroPoint() override
-  {
-    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE};
-    uint16_t id = param_.can_id;
-    LibXR::CAN::ClassicPack tx_pack{};
-    tx_pack.id = id;
-    tx_pack.type = LibXR::CAN::Type::STANDARD;
-    tx_pack.dlc = 8;
-    memcpy(tx_pack.data, data, 8);
-    can_->AddMessage(tx_pack);
+  LibXR::ErrorCode PositionVelocityTorqueControl(float position,
+                                                  float velocity_limit,
+                                                  float torque_limit) {
+    if (param_.control_type != ControlType::PVT) {
+      last_tx_status_ = LibXR::ErrorCode::STATE_ERR;
+      return last_tx_status_;
+    }
+
+    const LimitParam& limit = param_.limits;
+    const float max_torque = MaxAbsTorque();
+    if (max_torque <= 0.0f) {
+      last_tx_status_ = LibXR::ErrorCode::ARG_ERR;
+      return last_tx_status_;
+    }
+
+    const float send_position = ToMotorDirection(
+        position, limit.p_min, limit.p_max);
+    const uint16_t velocity_raw = static_cast<uint16_t>(std::clamp(
+        std::abs(velocity_limit) * 100.0f, 0.0f, 10000.0f));
+    const uint16_t torque_raw = static_cast<uint16_t>(std::clamp(
+        std::abs(torque_limit) / max_torque * 10000.0f, 0.0f, 10000.0f));
+
+    uint8_t data[8]{};
+    std::memcpy(data, &send_position, sizeof(send_position));
+    data[4] = static_cast<uint8_t>(velocity_raw);
+    data[5] = static_cast<uint8_t>(velocity_raw >> 8);
+    data[6] = static_cast<uint8_t>(torque_raw);
+    data[7] = static_cast<uint8_t>(torque_raw >> 8);
+
+    last_tx_status_ = SendFrame(param_.control_id, data, sizeof(data));
+    return last_tx_status_;
   }
+
+  [[nodiscard]] float GetAngle() const { return feedback_.position; }
+  [[nodiscard]] float GetTorque() const { return feedback_.torque; }
+  [[nodiscard]] float GetOmega() const { return feedback_.omega; }
+  [[nodiscard]] float GetMaxTorque() const { return MaxAbsTorque(); }
+  [[nodiscard]] const char* GetName() const { return param_.motor_name; }
+  [[nodiscard]] uint32_t GetControlId() const { return param_.control_id; }
+  [[nodiscard]] uint32_t GetFeedbackId() const { return param_.feedback_id; }
+  [[nodiscard]] ControlType GetControlType() const {
+    return param_.control_type;
+  }
+  [[nodiscard]] LibXR::ErrorCode GetLastTxStatus() const {
+    return last_tx_status_;
+  }
+  [[nodiscard]] LibXR::MicrosecondTimestamp GetLastOnlineTime() const {
+    return last_online_time_;
+  }
+
+  /** @brief 根据最近一次反馈时间判断电机是否在线。 */
+  [[nodiscard]] bool IsOnline(uint64_t timeout_us = 100000) const {
+    if (static_cast<uint64_t>(last_online_time_) == 0) {
+      return false;
+    }
+    return (LibXR::Timebase::GetMicroseconds() - last_online_time_)
+               .ToMicrosecond() <= timeout_us;
+  }
+
+  /** @brief 供构造前检查实例参数。 */
+  [[nodiscard]] static bool IsParamValid(const Param& param) {
+    const LimitParam& limit = param.limits;
+    return param.can_bus_name != nullptr && param.motor_name != nullptr &&
+           param.control_id <= 0x7FFu && param.feedback_id <= 0x7FFu &&
+           limit.p_max > limit.p_min && limit.v_max > limit.v_min &&
+           limit.kp_max > limit.kp_min && limit.kd_max > limit.kd_min &&
+           limit.t_max > limit.t_min;
+  }
+
+  void OnMonitor() override {}
 
  private:
-  uint64_t last_online_time_;
-  Param param_;
-  LSB lsb_;
-  Motor::Feedback feedback_;
-  LibXR::CAN* can_;
-  LibXR::LatestSnapshot<LibXR::CAN::ClassicPack> feedback_frame_{LibXR::CAN::ClassicPack{}};
+  static constexpr std::size_t RX_QUEUE_DEPTH = 4;
 
-  int FloatToUint(float x, float x_min, float x_max, int bits)
-  {
-    float span = x_max - x_min;
-    float offset = x_min;
-    return static_cast<int>((x - offset) * (static_cast<float>((1 << bits) - 1)) / span);
+  static uint16_t FloatToUint(float value, float min, float max,
+                              uint8_t bits) {
+    value = std::clamp(value, min, max);
+    const uint32_t raw_max = (1u << bits) - 1u;
+    const float normalized = (value - min) / (max - min);
+    return static_cast<uint16_t>(normalized * static_cast<float>(raw_max));
   }
 
-  float UintToFloat(int x_int, float x_min, float x_max, int bits)
-  {
-    float span = x_max - x_min;
-    float offset = x_min;
-    return (static_cast<float>(x_int)) * span / (static_cast<float>((1 << bits) - 1)) +
-           offset;
+  static float UintToFloat(uint16_t value, float min, float max,
+                           uint8_t bits) {
+    const uint32_t raw_max = (1u << bits) - 1u;
+    return static_cast<float>(value) * (max - min) /
+               static_cast<float>(raw_max) +
+           min;
   }
 
-  /**
-   * @brief CAN 接收回调：保存最新的反馈帧，覆盖尚未取走的旧帧。
-   *        CAN receive callback: store the latest feedback frame, replacing an older
-   *        frame that has not been taken.
-   *
-   * @param in_isr 是否在中断上下文中调用。
-   *               Whether called from interrupt context.
-   * @param self DMMotor 实例指针。
-   *             Pointer to the DMMotor instance.
-   * @param pack 接收到的 CAN 数据包。
-   *             Received CAN packet.
-   */
-  static void RxCallback(bool in_isr, DMMotor* self, const LibXR::CAN::ClassicPack& pack)
-  {
+  float DirectionFactor() const { return param_.reverse ? -1.0f : 1.0f; }
+
+  float ToMotorDirection(float value, float min, float max) const {
+    return std::clamp(DirectionFactor() * value, min, max);
+  }
+
+  float MaxAbsTorque() const {
+    return std::max(std::abs(param_.limits.t_min),
+                    std::abs(param_.limits.t_max));
+  }
+
+  LibXR::ErrorCode SendSpecialCommand(uint8_t command) {
+    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF,
+                       0xFF, 0xFF, 0xFF, command};
+    return SendFrame(param_.control_id, data, sizeof(data));
+  }
+
+  LibXR::ErrorCode SendFrame(uint32_t id, const uint8_t* data, uint8_t dlc) {
+    if (data == nullptr || dlc > 8) {
+      return LibXR::ErrorCode::ARG_ERR;
+    }
+
+    LibXR::CAN::ClassicPack pack{};
+    pack.id = id;
+    pack.type = LibXR::CAN::Type::STANDARD;
+    pack.dlc = dlc;
+    std::memcpy(pack.data, data, dlc);
+    return can_->AddMessage(pack);
+  }
+
+  static void RxCallback(bool in_isr, DMMotor* self,
+                         const LibXR::CAN::ClassicPack& pack) {
     UNUSED(in_isr);
-    self->feedback_frame_.Store(pack);
+    while (self->recv_queue_.Push(pack) != LibXR::ErrorCode::OK) {
+      self->recv_queue_.Pop();
+    }
   }
 
-  void Decode(LibXR::CAN::ClassicPack& pack)
-  {
-    feedback_.error_id = (pack.data[0]) & 0x0F;
-    feedback_.state = (pack.data[0]) >> 4;
+  LibXR::ErrorCode Decode(const LibXR::CAN::ClassicPack& pack) {
+    if (pack.dlc < 8) {
+      return LibXR::ErrorCode::SIZE_ERR;
+    }
+
+    const LimitParam& limit = param_.limits;
+    const uint16_t position_raw =
+        static_cast<uint16_t>((static_cast<uint16_t>(pack.data[1]) << 8) |
+                              static_cast<uint16_t>(pack.data[2]));
+    const uint16_t velocity_raw =
+        static_cast<uint16_t>((static_cast<uint16_t>(pack.data[3]) << 4) |
+                              (static_cast<uint16_t>(pack.data[4]) >> 4));
+    const uint16_t torque_raw = static_cast<uint16_t>(
+        ((static_cast<uint16_t>(pack.data[4]) & 0x0Fu) << 8) |
+        static_cast<uint16_t>(pack.data[5]));
+
+    feedback_.error_id = pack.data[0] & 0x0F;
+    feedback_.state = pack.data[0] >> 4;
     feedback_.position =
-        UintToFloat(static_cast<int16_t>((pack.data[1] << 8) | pack.data[2]), -lsb_.P_MAX,
-                    lsb_.P_MAX, 16);
-
+        DirectionFactor() *
+        UintToFloat(position_raw, limit.p_min, limit.p_max, 16);
     feedback_.omega =
-        UintToFloat(static_cast<int16_t>((pack.data[3] << 4) | (pack.data[4] >> 4)),
-                    -lsb_.V_MAX, lsb_.V_MAX, 12);
-    feedback_.velocity = feedback_.omega * 60.0f / static_cast<float>(LibXR::TWO_PI);
+        DirectionFactor() *
+        UintToFloat(velocity_raw, limit.v_min, limit.v_max, 12);
+    feedback_.velocity =
+        feedback_.omega * 60.0f / static_cast<float>(LibXR::TWO_PI);
     feedback_.torque =
-        UintToFloat(static_cast<int16_t>(((pack.data[4] & 0xF) << 8) | pack.data[5]),
-                    -lsb_.T_MAX, lsb_.T_MAX, 12);
-    feedback_.temp =
-        static_cast<float>(pack.data[6] > pack.data[7] ? pack.data[6] : pack.data[7]);
-
-    if (param_.reverse)
-    {
-      feedback_.position = -feedback_.position;
-      feedback_.velocity = -feedback_.velocity;
-      feedback_.torque = -feedback_.torque;
-      feedback_.omega = -feedback_.omega;
-    }
+        DirectionFactor() *
+        UintToFloat(torque_raw, limit.t_min, limit.t_max, 12);
+    feedback_.temp = static_cast<float>(
+        std::max(pack.data[6], pack.data[7]));
     feedback_.abs_angle = feedback_.position;
+
+    return LibXR::ErrorCode::OK;
   }
 
- public:
-  /**
-   * @brief 获取反馈位置。
-   *        Get the feedback position.
-   *
-   * @return 位置，单位 rad。
-   *         Position in rad.
-   */
-  float GetAngle() const { return feedback_.position; }
-
-  /**
-   * @brief 获取反馈力矩。
-   *        Get the feedback torque.
-   *
-   * @return 力矩，单位 N·m。
-   *         Torque in N·m.
-   */
-  float GetTor() const { return feedback_.torque; }
-
-  /**
-   * @brief 获取反馈角速度。
-   *        Get the feedback angular velocity.
-   *
-   * @return 角速度，单位 rad/s。
-   *         Angular velocity in rad/s.
-   */
-  float GetOmega() const { return feedback_.omega; }
-
-  /**
-   * @brief 发送 MIT 控制帧。
-   *        Send an MIT control frame.
-   *
-   * 反馈温度超过 90 ℃ 时先发送失能帧并输出警告日志，随后仍发送本帧。pos、vel、tor
-   * 先按型号量程限幅。
-   * When the feedback temperature exceeds 90 ℃, the disable frame is sent and a warning
-   * is logged first, and this frame is then sent as usual. pos, vel and tor are first
-   * clamped to the model range.
-   *
-   * @param pos 目标位置，单位 rad。
-   *            Target position in rad.
-   * @param vel 目标速度，单位 rad/s。
-   *            Target velocity in rad/s.
-   * @param kp 位置刚度。
-   *           Position stiffness.
-   * @param kd 速度阻尼。
-   *           Velocity damping.
-   * @param tor 前馈力矩，单位 N·m。
-   *            Feedforward torque in N·m.
-   */
-  void MITControl(float pos, float vel, float kp, float kd, float tor)
-  {
-    if (this->feedback_.temp > 90.0f)
-    {
-      Disable();
-      XR_LOG_WARN("motor %u high temperature detected",
-                  static_cast<unsigned>(param_.can_id));
-    }
-    pos = std::clamp(pos, -lsb_.P_MAX, lsb_.P_MAX);
-    vel = std::clamp(vel, -lsb_.V_MAX, lsb_.V_MAX);
-    tor = std::clamp(tor, -lsb_.T_MAX, lsb_.T_MAX);
-
-    float send_pos = param_.reverse ? -pos : pos;
-    float send_vel = param_.reverse ? -vel : vel;
-    float send_tor = param_.reverse ? -tor : tor;
-
-    uint16_t pos_u = FloatToUint(send_pos, -lsb_.P_MAX, lsb_.P_MAX, 16);
-    uint16_t vel_u = FloatToUint(send_vel, -lsb_.V_MAX, lsb_.V_MAX, 12);
-    uint16_t tor_u = FloatToUint(send_tor, -lsb_.T_MAX, lsb_.T_MAX, 12);
-    uint16_t kp_u = FloatToUint(kp, lsb_.KP_MIN, lsb_.KP_MAX, 12);
-    uint16_t kd_u = FloatToUint(kd, lsb_.KD_MIN, lsb_.KD_MAX, 12);
-
-    uint8_t data[8];
-    data[0] = (pos_u >> 8) & 0xFF;
-    data[1] = pos_u & 0xFF;
-    data[2] = (vel_u >> 4) & 0xFF;
-    data[3] = ((vel_u & 0xF) << 4) | ((kp_u >> 8) & 0xF);
-    data[4] = kp_u & 0xFF;
-    data[5] = (kd_u >> 4) & 0xFF;
-    data[6] = ((kd_u & 0xF) << 4) | ((tor_u >> 8) & 0xF);
-    data[7] = tor_u & 0xFF;
-
-    uint16_t id = param_.can_id;
-    LibXR::CAN::ClassicPack tx_pack{};
-    tx_pack.id = id;
-    tx_pack.type = LibXR::CAN::Type::STANDARD;
-    tx_pack.dlc = 8;
-    memcpy(tx_pack.data, data, 8);
-    can_->AddMessage(tx_pack);
-  }
-
- private:
-  void PosControl(float pos, float vel)
-  {
-    if (this->feedback_.temp > 90.0f)
-    {
-      XR_LOG_WARN("motor %u high temperature detected",
-                  static_cast<unsigned>(param_.can_id));
-      Disable();
-    }
-    pos = std::clamp(pos, -lsb_.P_MAX, lsb_.P_MAX);
-    vel = std::clamp(vel, -lsb_.V_MAX, lsb_.V_MAX);
-
-    float send_pos = param_.reverse ? -pos : pos;
-    float send_vel = param_.reverse ? -vel : vel;
-
-    uint8_t data[8];
-    uint8_t* pbuf = reinterpret_cast<uint8_t*>(&send_pos);
-    uint8_t* vbuf = reinterpret_cast<uint8_t*>(&send_vel);
-
-    for (int i = 0; i < 4; ++i)
-    {
-      data[i] = pbuf[i];
-      data[i + 4] = vbuf[i];
-    }
-
-    uint16_t id = param_.can_id;
-    LibXR::CAN::ClassicPack tx_pack{};
-    tx_pack.id = id;
-    tx_pack.type = LibXR::CAN::Type::STANDARD;
-    tx_pack.dlc = 8;
-    memcpy(tx_pack.data, data, 8);
-    can_->AddMessage(tx_pack);
-  }
-
-  void SpdControl(float vel)
-  {
-    if (this->feedback_.temp > 85.0f)
-    {
-      Disable();
-      XR_LOG_WARN("motor %u high temperature detected",
-                  static_cast<unsigned>(param_.can_id));
-    }
-
-    vel = std::clamp(vel, -lsb_.V_MAX, lsb_.V_MAX);
-    float send_vel = param_.reverse ? -vel : vel;
-
-    uint8_t data[4];
-    uint8_t* vbuf = reinterpret_cast<uint8_t*>(&send_vel);
-
-    for (int i = 0; i < 4; ++i)
-    {
-      data[i] = vbuf[i];
-    }
-
-    uint32_t id = param_.can_id;
-    LibXR::CAN::ClassicPack tx_pack{};
-    tx_pack.id = id;
-    tx_pack.type = LibXR::CAN::Type::STANDARD;
-    tx_pack.dlc = 8;
-    memcpy(tx_pack.data, data, 4);
-    can_->AddMessage(tx_pack);
-  }
+  Param param_;
+  Motor::Feedback feedback_{};
+  LibXR::CAN* can_;
+  LibXR::MPMCQueue<LibXR::CAN::ClassicPack> recv_queue_{RX_QUEUE_DEPTH};
+  LibXR::MicrosecondTimestamp last_online_time_{};
+  LibXR::ErrorCode last_tx_status_ = LibXR::ErrorCode::OK;
 };

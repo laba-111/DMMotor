@@ -1,136 +1,164 @@
-# DMMotor
+# DMMotor 通用控制层
 
-达妙（DM）电机 CAN 驱动模块，支持 DM4310 与 DM8009 / CAN driver Module for Damiao (DM) motors, supporting the DM4310 and DM8009
+该模块从原 `mod_motors.hpp/.cpp` 中提取达妙电机相关逻辑，并采用与其他
+xrobot 模块一致的单类、单头文件结构。类内不维护 `DM4310`、`DM4340`、
+`DM8009` 等型号枚举；型号差异全部由每个实例的 `DMMotor::Param` 表达。
 
-## 1. 模块作用 / Purpose
+## 设计边界
 
-DMMotor 封装达妙 CAN 协议并实现 `Motor` 抽象接口。构造时在 CAN 总线上注册一个标准帧回调，接收 ID 为 `0x10 + can_id` 的反馈帧；反馈帧存入 LibXR 的 `LatestSnapshot`，只保留最新一帧。
+- 本模块负责 CAN 收发、MIT/PV/V/PVT 报文打包、反馈解码和在线状态记录。
+- 本模块不创建控制线程，不包含关节 PID、运动学或机械臂控制策略。
+- `control_id` 和 `feedback_id` 都是完整 CAN ID，不推导 `ID + 0x10`。
+- `limits` 必须与达妙上位机中的 `PMAX/VMAX/TMAX` 一致，否则命令和反馈都会缩放错误。
+- 一台电机在一个实例中只使用一种 `ControlType`；切换电机内部模式后应同步修改实例配置。
 
-`Update()` 取出并解码反馈：`position`（rad）、`omega`（rad/s）、`velocity`（rpm，由 `omega` 换算）、`torque`（N·m）、`temp`（帧内两路温度的较大值）、`error_id`（帧首字节低 4 位）与 `state`（帧首字节高 4 位）；`abs_angle` 取 `position`。`reverse = true` 时，反馈的 `position`、`velocity`、`omega`、`torque` 取反，下发的位置、速度与力矩也取反。
+## 文件
 
-所有控制帧以 `can_id` 为 ID 发送，`Control()` 按 `MotorCmd::mode` 处理：
+- `DMMotor.hpp`：完整控制层，header-only。
+- `CMakeLists.txt`：把模块目录加入 `xr` 目标的包含路径。
 
-| `MotorCmd::mode` | 行为 |
-| --- | --- |
-| `MODE_MIT` | MIT 帧，使用 `position`、`velocity`、`kp`、`kd`、`torque` |
-| `MODE_TORQUE` | MIT 帧，仅 `torque` 有值，位置、速度、`kp`、`kd` 为 0 |
-| `MODE_POSITION` | 位置速度帧，使用 `position`、`velocity`（float） |
-| `MODE_VELOCITY` | 速度帧，使用 `velocity`（float） |
-| `MODE_CURRENT` | 忽略 |
+## 1. 配置实例
 
-下发的位置、速度与力矩先按型号量程限幅，`reduction_ratio` 不参与计算。`Enable()`、`Disable()`、`ClearError()`、`SaveZeroPoint()` 分别发送达妙的使能（`0xFC`）、失能（`0xFD`）、清错（`0xFB`）与保存零点（`0xFE`）特殊帧，`Relax()` 与 `Disable()` 相同。
-
-MIT 与位置模式下，反馈温度超过 90 ℃ 时发送失能帧并输出 `XR_LOG_WARN`；速度模式的阈值为 85 ℃。该次控制帧随后照常发送。
-
-除 `Motor` 接口外，公共接口还有 `MITControl(pos, vel, kp, kd, tor)`、`GetAngle()`、`GetTor()` 与 `GetOmega()`。
-
-DMMotor implements the `Motor` interface on top of the Damiao CAN protocol. Upon construction it registers a standard-frame callback on the CAN bus that receives feedback frames with ID `0x10 + can_id`. Feedback frames are stored in LibXR's `LatestSnapshot`, which keeps only the latest frame.
-
-`Update()` pops and decodes the feedback: `position` (rad), `omega` (rad/s), `velocity` (rpm, converted from `omega`), `torque` (N·m), `temp` (the larger of the two temperatures in the frame), `error_id` (low 4 bits of the first byte) and `state` (high 4 bits of the first byte); `abs_angle` takes the value of `position`. With `reverse = true`, the feedback `position`, `velocity`, `omega` and `torque` are negated, as are the position, velocity and torque that are sent.
-
-All control frames are sent with `can_id` as the ID, and `Control()` handles `MotorCmd::mode` as follows:
-
-| `MotorCmd::mode` | Behavior |
-| --- | --- |
-| `MODE_MIT` | MIT frame using `position`, `velocity`, `kp`, `kd` and `torque` |
-| `MODE_TORQUE` | MIT frame with only `torque` set; position, velocity, `kp` and `kd` are 0 |
-| `MODE_POSITION` | Position-velocity frame using `position` and `velocity` (float) |
-| `MODE_VELOCITY` | Velocity frame using `velocity` (float) |
-| `MODE_CURRENT` | Ignored |
-
-The position, velocity and torque that are sent are first clamped to the model range, and `reduction_ratio` is not used in the calculation. `Enable()`, `Disable()`, `ClearError()` and `SaveZeroPoint()` send the Damiao special frames for enable (`0xFC`), disable (`0xFD`), clear error (`0xFB`) and save zero point (`0xFE`) respectively; `Relax()` is the same as `Disable()`.
-
-In MIT and position modes, a feedback temperature above 90 ℃ makes the Module send the disable frame and emit `XR_LOG_WARN`; the threshold in velocity mode is 85 ℃. The control frame of that call is then sent as usual.
-
-Besides the `Motor` interface, the public interface includes `MITControl(pos, vel, kp, kd, tor)`, `GetAngle()`, `GetTor()` and `GetOmega()`.
-
-## 2. 型号量程 / Model Ranges
-
-`Param::model` 选择量程，对应源码中的宏：
-
-| 型号 | P_MAX (rad) | V_MAX (rad/s) | T_MAX (N·m) | KP | KD |
-| --- | --- | --- | --- | --- | --- |
-| `MOTOR_DM4310` | 6.283185 | 30 | 10 | 0 – 500 | 0 – 5 |
-| `MOTOR_DM8009` | 12.56637 | 45 | 54 | 0 – 500 | 0 – 5 |
-
-`MOTOR_NONE` 的各项量程均为 0。
-
-`Param::model` selects the range, which corresponds to the macros in the source:
-
-| Model | P_MAX (rad) | V_MAX (rad/s) | T_MAX (N·m) | KP | KD |
-| --- | --- | --- | --- | --- | --- |
-| `MOTOR_DM4310` | 6.283185 | 30 | 10 | 0 – 500 | 0 – 5 |
-| `MOTOR_DM8009` | 12.56637 | 45 | 54 | 0 – 500 | 0 – 5 |
-
-All ranges of `MOTOR_NONE` are 0.
-
-## 3. 构造接口 / Constructor
+下面的 4310 与 4340 数值沿用原工程中的实例配置。它们只是示例；如果你在
+达妙上位机中修改过映射范围，应填写电机当前的真实值。
 
 ```cpp
-DMMotor(LibXR::CAN& can_bus,
-        const Param& param = {.model = DMMotor::Model::MOTOR_DM4310,
-                              .reverse = false,
-                              .can_id = 1});
+#include "DMMotor.hpp"
+
+DMMotor::Param dm4310_param{
+    "can1",                         // CAN 硬件在 HardwareContainer 中的名称
+    "roll_4310",                    // 仅用于辨识实例
+    0x004,                           // 当前控制模式使用的完整控制 ID
+    0x104,                           // 上位机配置的反馈 ID / MST_ID
+    false,                           // 是否反向
+    DMMotor::ControlType::MIT,
+    {-3.14159f, 3.14159f,            // p_min, p_max (rad)
+     -30.0f, 30.0f,                  // v_min, v_max (rad/s)
+     0.0f, 500.0f,                   // kp_min, kp_max
+     0.0f, 5.0f,                     // kd_min, kd_max
+     -10.0f, 10.0f},                 // t_min, t_max (Nm)
+};
+
+DMMotor::Param dm4340_param{
+    "can1",
+    "pitch_4340",
+    0x005,
+    0x105,
+    true,
+    DMMotor::ControlType::MIT,
+    {-3.14159f, 3.14159f,
+     -10.0f, 10.0f,
+     0.0f, 500.0f,
+     0.0f, 5.0f,
+     -28.0f, 28.0f},
+};
+
+DMMotor dm4310(hw, app, dm4310_param);
+DMMotor dm4340(hw, app, dm4340_param);
 ```
 
-依赖：
+同一个类可以创建任意数量、任意型号的实例；只要每个实例的 CAN ID 不冲突，
+并且量程与对应电机一致即可。
 
-- `can_bus`：`LibXR::CAN`，电机所在的 CAN 总线，取自 BSP 的硬件注册（`XR_REGISTER`）。
+## 2. 周期更新与控制
 
-配置参数（`Param`）：
+上层控制线程中先调用 `Update()` 消费反馈，再根据反馈状态使能、清错或控制：
 
-- `model`：电机型号，`DMMotor::Model::MOTOR_DM4310`、`MOTOR_DM8009` 或 `MOTOR_NONE`，默认 `MOTOR_DM4310`。
-- `reverse`：是否反向，默认 `false`。
-- `can_id`：电机控制 ID，默认 1；反馈 ID 为 `0x10 + can_id`。
+```cpp
+void MotorLoop(DMMotor& motor) {
+  motor.Update();
+  const Motor::Feedback& feedback = motor.GetFeedback();
 
-Dependencies:
+  if (!motor.IsOnline()) {
+    // 尚未收到反馈，按系统安全策略处理。
+    return;
+  }
 
-- `can_bus`: the `LibXR::CAN` bus the motor is attached to, taken from the BSP's Registration (`XR_REGISTER`).
+  if (feedback.state == 0) {
+    motor.Enable();
+    return;
+  }
 
-Configuration parameters (`Param`):
+  if (feedback.state != 1) {
+    motor.ClearError();
+    return;
+  }
 
-- `model`: motor model, `DMMotor::Model::MOTOR_DM4310`, `MOTOR_DM8009` or `MOTOR_NONE`, default `MOTOR_DM4310`.
-- `reverse`: whether the direction is reversed, default `false`.
-- `can_id`: motor control ID, default 1; the feedback ID is `0x10 + can_id`.
+  Motor::MotorCmd command{};
+  command.mode = Motor::ControlMode::MODE_MIT;
+  command.position = 0.5f;
+  command.velocity = 0.0f;
+  command.kp = 20.0f;
+  command.kd = 0.5f;
+  command.torque = 0.0f;
+  motor.Control(command);
+}
+```
 
-## 4. Topic
+位置闭环时不要把 `kd` 设为 0，并应从较小的 `kp/kd/torque` 开始调试。
 
-无 / None
+## 3. 直接调用四种协议
 
-## 5. 配置示例 / Configuration Example
+除了统一的 `Motor::Control()`，也可以直接调用协议接口。方法只会在实例的
+`control_type` 匹配时发帧，否则返回 `LibXR::ErrorCode::STATE_ERR`。
 
-`xrobot instance add QDU-Robomaster/DMMotor` 写入的实例，`can_bus` 填写为 BSP 中注册的 CAN 名称，`model`、`reverse`、`can_id` 按电机填写：
+```cpp
+motor.MITControl(position, velocity, kp, kd, feedforward_torque);
+motor.PositionVelocityControl(position, velocity);       // ControlType::PV
+motor.VelocityControl(velocity);                          // ControlType::V
+motor.PositionVelocityTorqueControl(position,
+                                    velocity_limit,
+                                    torque_limit);        // ControlType::PVT
+```
 
-An instance written by `xrobot instance add QDU-Robomaster/DMMotor`, with `can_bus` set to a CAN name registered by the BSP, and `model`, `reverse` and `can_id` set according to the motor:
+控制 ID 应按电机当前模式填写完整值。沿用原驱动的约定时通常为：MIT 使用
+`ID`、PV 使用 `0x100 + ID`、V 使用 `0x200 + ID`、PVT 使用 `0x300 + ID`。
+反馈 ID 独立填写，以达妙上位机的 `MST_ID` 为准。
+
+例如一台基础 ID 为 `0x005`、处于速度模式的电机，可以这样配置：
+
+```cpp
+DMMotor::Param velocity_motor_param{
+    "can1", "velocity_motor", 0x205, 0x105, false,
+    DMMotor::ControlType::V,
+    {-3.14159f, 3.14159f, -10.0f, 10.0f,
+     0.0f, 500.0f, 0.0f, 5.0f, -28.0f, 28.0f},
+};
+```
+
+## 4. YAML 构造参数
+
+模块头部已经提供 Manifest V2。对应的参数形状如下：
 
 ```yaml
-modules:
-  - module: QDU-Robomaster/DMMotor
-    id: motor_pit
-    args:
-      - can_bus: can1
-      - param:
-          model: DMMotor::Model::MOTOR_DM4310
-          reverse: true
-          can_id: 1
+param:
+  can_bus_name: can1
+  motor_name: roll_4310
+  control_id: 4
+  feedback_id: 260
+  reverse: false
+  control_type: DMMotor::ControlType::MIT
+  limits:
+    p_min: -3.1415926
+    p_max: 3.1415926
+    v_min: -30.0
+    v_max: 30.0
+    kp_min: 0.0
+    kp_max: 500.0
+    kd_min: 0.0
+    kd_max: 5.0
+    t_min: -10.0
+    t_max: 10.0
 ```
 
-其他模块（例如 `QDU-Robomaster/Gimbal`）的 `Motor&` 参数填写本实例的 id（此处为 `motor_pit`），本实例须在它们之前列出。
+## 5. 调试顺序
 
-Other Modules (for example `QDU-Robomaster/Gimbal`) take the id of this instance (here `motor_pit`) for their `Motor&` parameter; this instance is listed before them.
+1. 在达妙上位机确认控制模式、控制 ID、反馈 ID、PMAX、VMAX 和 TMAX。
+2. 让代码配置与这些值完全一致，并确认 CAN 使用标准帧和正确波特率。
+3. 电机悬空或卸载，从失能状态开始；先确认 `Update()` 能得到合理反馈。
+4. 发送 `Enable()`，使用很小的 `kp/kd/torque` 测试方向。
+5. 方向相反时修改 `reverse`，不要同时交换反馈符号和命令符号。
+6. 稳定后再逐步提高控制参数和负载。
 
-## 6. 依赖与硬件 / Dependencies and Hardware
-
-依赖：
-
-- `QDU-Robomaster/Motor`：本模块实现的电机抽象接口。
-- LibXR。
-
-硬件：挂在 CAN 总线上的达妙电机（DM4310 或 DM8009），总线对象由 BSP 通过 `XR_REGISTER` 注册；电机的控制 ID 为 `can_id`，反馈帧 ID 为 `0x10 + can_id`。
-
-Dependencies:
-
-- `QDU-Robomaster/Motor`: the motor abstraction interface implemented by this Module.
-- LibXR.
-
-Hardware: a Damiao motor (DM4310 or DM8009) on a CAN bus whose object the BSP registers with `XR_REGISTER`; the motor control ID is `can_id` and the feedback frame ID is `0x10 + can_id`.
+`GetLastTxStatus()` 可查看最近一次发送结果，`IsOnline(timeout_us)` 可按反馈时间
+判断电机是否在线；默认超时时间为 100 ms。
